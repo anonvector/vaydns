@@ -1169,7 +1169,17 @@ func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 		return fmt.Errorf("opening KCP listener: %v", err)
 	}
 	defer ln.Close()
+
+	// We will run acceptSessions, sendLoop, and recvLoop concurrently. The
+	// first one to finish closes the done channel, which causes Run to
+	// return. This ensures that a failure in any goroutine takes the whole
+	// process down rather than leaving a "running but not working" server.
+	doneChan := make(chan struct{})
+	var doneOnce sync.Once
+	done := func() { doneOnce.Do(func() { close(doneChan) }) }
+
 	go func() {
+		defer done()
 		err := acceptSessions(ln, privkey, mtu, upstream, idleTimeout, keepAlive, kcpWindowSize)
 		if err != nil {
 			log.Warnf("accept sessions: %v", err)
@@ -1198,13 +1208,23 @@ func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 	// for each response to collect downstream data before being evicted by
 	// another response that needs to be sent.
 	go func() {
+		defer done()
 		err := sendLoop(dnsConn, ttConn, ch, maxEncodedPayload, domain)
 		if err != nil {
 			log.Warnf("sendLoop: %v", err)
 		}
 	}()
 
-	return recvLoop(domain, dnsConn, ttConn, ch, fallbackMgr, stats, wireConfig)
+	go func() {
+		defer done()
+		err := recvLoop(domain, dnsConn, ttConn, ch, fallbackMgr, stats, wireConfig)
+		if err != nil {
+			log.Warnf("recvLoop: %v", err)
+		}
+	}()
+
+	<-doneChan
+	return nil
 }
 
 var version = "dev"
